@@ -1,16 +1,12 @@
 import serial
-from websockets.sync.client import connect
+import requests as req
+import hashlib, base64, time, json
 
-import hashlib, base64
-
-WS_BACKEND_URL = "wss://temperature-backend--residualentropy.repl.co"
+BACKEND_URL = "https://oa-backend.residualentropy.repl.co"
 
 SECRET = None
 with open("secret.txt", 'r') as f:
 	SECRET = f.read().strip()
-
-def retrieve_secret():
-	return SECRET
 
 def main():
 	print('Running...')
@@ -20,30 +16,51 @@ def main():
 		print(f'Using serial port {ser.name}.')
 		print(f'Baud rate is {ser.baudrate}.')
 		print(f'Serial port object: {repr(ser)}.')
-		print('Connecting to websockets endpoint...')
-		with connect(WS_BACKEND_URL) as ws:
-			print('Connected to websockets.')
-			print('Endpoint URL is {WS_BACKEND_URL}')
-			print(f'Websockets connection object: {repr(ws)}')
-			print('[ws-layer] Waiting for challenge...')
-			challenge = ws.recv()
-			assert challenge[0] == 'c'
-			challenge = challenge[1:]
-			print('[ws-layer] Computing response...')
-			resp = hashlib.sha384(
-				(retrieve_secret() + challenge) \
-					.encode('utf-8')
-			).digest()
-			print('[ws-layer] Sending response...')
-			ws.send('r' + base64.b64encode(resp).decode('utf-8'))
-			print('[ws-layer] Connection should be ready.')
-			print('[ws-layer] Proxying serial port data...')
-			while True:
-				line = ser.readline()
-				text = line.decode('utf-8')
-				print('[ws-layer] [ser-proxy] Sending...', end='')
-				ws.send(f'd{text.strip()}')
-				print('[ws-layer] [ser-proxy] sent!')
+		print('[api] Backend endpoint URL is {BACKEND_URL}')
+		print('[api.auth] Asking for challenge...')
+		challenge_hresp = req.get(f'{BACKEND_URL}/auth/get_challenge')
+		challenge = challenge_hresp.json()['challenge']
+		print('[api.auth] Computing response...')
+		resp = hashlib.sha384(
+			(challenge + SECRET) \
+				.encode('utf-8')
+		).digest()
+		resp = base64.urlsafe_b64encode(resp).decode('utf-8')
+		print('[api.auth] Sending response and asking for token...')
+		tok_hresp = req.get(f'{BACKEND_URL}/auth/get_token?challenge={challenge}&response={resp}')
+		tok_json = tok_hresp.json()
+		if not tok_json["ok"]:
+			raise RuntimeError("Authentication failed. Please try again.")
+		tok = tok_json["token"]
+		print('[api.auth] Should have valid token.')
+		print('[api <- ser-proxy] Proxying serial port data...')
+		while True:
+			line = ser.readline()
+			text = line.decode('utf-8')
+			print('[api <- ser-proxy] Sending...', end='')
+			text = text.strip().replace('\'', '"')
+			obj = None
+			try:
+				obj = json.loads(text)
+			except:
+				print("!! Unable to parse JSON, ignoring.")
+				print("!! --- BEGIN SAMPLE ---")
+				print(text)
+				print("!! --- END   SAMPLE ---")
+				continue
+			data = {
+				"temps": {
+					"unixts": int(time.time()),
+					"readings": obj,
+				},
+				"token": tok,
+			}
+			print({"temps": data["temps"], "token": "REDACTED"})
+			hresp = req.post(f'{BACKEND_URL}/api/w/temps', json=data)
+			print(hresp.text)
+			if not hresp.json()["w-ok"]:
+				raise RuntimeError("Writing failed. Please try again.")
+			print('[api <- ser-proxy] sent!')
 
 if __name__ == '__main__':
 	main()
